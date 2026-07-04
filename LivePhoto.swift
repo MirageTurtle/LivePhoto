@@ -9,9 +9,14 @@
 //  Copyright © 2018 Limit Point LLC. All rights reserved.
 //
 
+#if os(iOS)
 import UIKit
-import AVFoundation
 import MobileCoreServices
+#elseif os(macOS)
+import AppKit
+import CoreServices
+#endif
+import AVFoundation
 import Photos
 
 class LivePhoto {
@@ -25,15 +30,26 @@ class LivePhoto {
     }
     /// Generates a PHLivePhoto from an image and video.  Also returns the paired image and video.
     public class func generate(from imageURL: URL?, videoURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
+        generate(from: imageURL, videoURL: videoURL, creationDate: nil, progress: progress, completion: completion)
+    }
+
+    /// Generates a PHLivePhoto with a creation date for the Photos library.
+    public class func generate(from imageURL: URL?, videoURL: URL, creationDate: Date?, progress: @escaping (CGFloat) -> Void, completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
         queue.async {
-            shared.generate(from: imageURL, videoURL: videoURL, progress: progress, completion: completion)
+            shared.generate(from: imageURL, videoURL: videoURL, creationDate: creationDate, progress: progress, completion: completion)
         }
     }
     /// Save a Live Photo to the Photo Library by passing the paired image and video.
     public class func saveToLibrary(_ resources: LivePhotoResources, completion: @escaping (Bool) -> Void) {
+        saveToLibrary(resources, creationDate: nil, completion: completion)
+    }
+
+    /// Save a Live Photo to the Photo Library with a specific creation date.
+    public class func saveToLibrary(_ resources: LivePhotoResources, creationDate: Date?, completion: @escaping (Bool) -> Void) {
         PHPhotoLibrary.shared().performChanges({
             let creationRequest = PHAssetCreationRequest.forAsset()
             let options = PHAssetResourceCreationOptions()
+            creationRequest.creationDate = creationDate
             creationRequest.addResource(with: PHAssetResourceType.pairedVideo, fileURL: resources.pairedVideo, options: options)
             creationRequest.addResource(with: PHAssetResourceType.photo, fileURL: resources.pairedImage, options: options)
         }, completionHandler: { (success, error) in
@@ -43,7 +59,7 @@ class LivePhoto {
             completion(success)
         })
     }
-    
+
     // MARK: PRIVATE
     private static let shared = LivePhoto()
     private static let queue = DispatchQueue(label: "com.limit-point.LivePhotoQueue", attributes: .concurrent)
@@ -69,7 +85,7 @@ class LivePhoto {
             percent = Float(stillImageTime.value) / Float(videoAsset.duration.value)
         }
         guard let imageFrame = videoAsset.getAssetFrame(percent: percent) else { return nil }
-        guard let jpegData = UIImageJPEGRepresentation(imageFrame, 1.0) else { return nil }
+        guard let jpegData = CGImageCreateJPEGData(from: imageFrame, compressionQuality: 1.0) else { return nil }
         guard let url = cacheDirectory?.appendingPathComponent(UUID().uuidString).appendingPathExtension("jpg") else { return nil }
         do {
             try? jpegData.write(to: url)
@@ -82,7 +98,7 @@ class LivePhoto {
         }
     }
     
-    private func generate(from imageURL: URL?, videoURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
+    private func generate(from imageURL: URL?, videoURL: URL, creationDate: Date? = nil, progress: @escaping (CGFloat) -> Void, completion: @escaping (PHLivePhoto?, LivePhotoResources?) -> Void) {
         guard let cacheDirectory = cacheDirectory else {
             DispatchQueue.main.async {
                 completion(nil, nil)
@@ -97,7 +113,7 @@ class LivePhoto {
             }
             return
         }
-        addAssetID(assetIdentifier, toVideo: videoURL, saveTo: cacheDirectory.appendingPathComponent(assetIdentifier).appendingPathExtension("mov"), progress: progress) { (_videoURL) in
+        addAssetID(assetIdentifier, toVideo: videoURL, creationDate: creationDate, saveTo: cacheDirectory.appendingPathComponent(assetIdentifier).appendingPathExtension("mov"), progress: progress) { (_videoURL) in
             if let pairedVideoURL = _videoURL {
                 _ = PHLivePhoto.request(withResourceFileURLs: [pairedVideoURL, pairedImageURL], placeholderImage: nil, targetSize: CGSize.zero, contentMode: PHImageContentMode.aspectFit, resultHandler: { (livePhoto: PHLivePhoto?, info: [AnyHashable : Any]) -> Void in
                     if let isDegraded = info[PHLivePhotoInfoIsDegradedKey] as? Bool, isDegraded {
@@ -192,7 +208,7 @@ class LivePhoto {
     var videoReader: AVAssetReader?
     var assetWriter: AVAssetWriter?
     
-    func addAssetID(_ assetIdentifier: String, toVideo videoURL: URL, saveTo destinationURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (URL?) -> Void) {
+    func addAssetID(_ assetIdentifier: String, toVideo videoURL: URL, creationDate: Date? = nil, saveTo destinationURL: URL, progress: @escaping (CGFloat) -> Void, completion: @escaping (URL?) -> Void) {
         
         var audioWriterInput: AVAssetWriterInput?
         var audioReaderOutput: AVAssetReaderOutput?
@@ -205,15 +221,14 @@ class LivePhoto {
         do {
             // Create the Asset Writer
             assetWriter = try AVAssetWriter(outputURL: destinationURL, fileType: .mov)
-            // Create Video Reader Output
+            // Create Video Reader Output (passthrough — no re-encoding)
             videoReader = try AVAssetReader(asset: videoAsset)
-            let videoReaderSettings = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)]
-            let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoReaderSettings)
+            let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
             videoReader?.add(videoReaderOutput)
-            // Create Video Writer Input
-            let videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey : AVVideoCodecH264, AVVideoWidthKey : videoTrack.naturalSize.width, AVVideoHeightKey : videoTrack.naturalSize.height])
+            // Create Video Writer Input (passthrough — copies compressed samples)
+            let videoFormatHint = videoTrack.formatDescriptions.first as! CMFormatDescription?
+            let videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: videoFormatHint)
             videoWriterInput.transform = videoTrack.preferredTransform
-            videoWriterInput.expectsMediaDataInRealTime = true
             assetWriter?.add(videoWriterInput)
             // Create Audio Reader Output & Writer Input
             if let audioTrack = videoAsset.tracks(withMediaType: .audio).first {
@@ -237,11 +252,20 @@ class LivePhoto {
             // Create necessary identifier metadata and still image time metadata
             let assetIdentifierMetadata = metadataForAssetID(assetIdentifier)
             let stillImageTimeMetadataAdapter = createMetadataAdaptorForStillImageTime()
-            assetWriter?.metadata = [assetIdentifierMetadata]
+            var writerMetadata = [assetIdentifierMetadata]
+            if let creationDate = creationDate {
+                let dateItem = AVMutableMetadataItem()
+                dateItem.key = "com.apple.quicktime.creationdate" as (NSCopying & NSObjectProtocol)?
+                dateItem.keySpace = AVMetadataKeySpace(rawValue: "mdta")
+                dateItem.value = creationDate as (NSCopying & NSObjectProtocol)?
+                dateItem.dataType = "com.apple.metadata.datatype.UTF-8"
+                writerMetadata.append(dateItem)
+            }
+            assetWriter?.metadata = writerMetadata
             assetWriter?.add(stillImageTimeMetadataAdapter.assetWriterInput)
             // Start the Asset Writer
             assetWriter?.startWriting()
-            assetWriter?.startSession(atSourceTime: kCMTimeZero)
+            assetWriter?.startSession(atSourceTime: .zero)
             // Add still image metadata
             let _stillImagePercent: Float = 0.5
             stillImageTimeMetadataAdapter.append(AVTimedMetadataGroup(items: [metadataItemForStillImageTime()],timeRange: videoAsset.makeStillImageTimeRange(percent: _stillImagePercent, inFrameCount: frameCount)))
@@ -325,7 +349,7 @@ class LivePhoto {
             kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType as NSString:
             "com.apple.metadata.datatype.int8"            ]
         var desc : CMFormatDescription? = nil
-        CMMetadataFormatDescriptionCreateWithMetadataSpecifications(kCFAllocatorDefault, kCMMetadataFormatType_Boxed, [spec] as CFArray, &desc)
+        CMMetadataFormatDescriptionCreateWithMetadataSpecifications(allocator: kCFAllocatorDefault, metadataType: kCMMetadataFormatType_Boxed, metadataSpecifications: [spec] as CFArray, formatDescriptionOut: &desc)
         let input = AVAssetWriterInput(mediaType: .metadata,
                                        outputSettings: nil, sourceFormatHint: desc)
         return AVAssetWriterInputMetadataAdaptor(assetWriterInput: input)
@@ -446,29 +470,26 @@ fileprivate extension AVAsset {
         
         //print("stillImageTime = \(CMTimeGetSeconds(time))")
         
-        return CMTimeRangeMake(time, CMTimeMake(frameDuration, time.timescale))
+        return CMTimeRange(start: time, duration: CMTime(value: frameDuration, timescale:  time.timescale))
     }
     
-    func getAssetFrame(percent:Float) -> UIImage?
+    func getAssetFrame(percent:Float) -> CGImage?
     {
-        
+
         let imageGenerator = AVAssetImageGenerator(asset: self)
         imageGenerator.appliesPreferredTrackTransform = true
-        
-        imageGenerator.requestedTimeToleranceAfter = CMTimeMake(1,100)
-        imageGenerator.requestedTimeToleranceBefore = CMTimeMake(1,100)
-        
+
+        imageGenerator.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 100)
+        imageGenerator.requestedTimeToleranceBefore = CMTime(value: 1, timescale: 100)
+
         var time = self.duration
-        
+
         time.value = Int64(Float(time.value) * percent)
-        
+
         do {
-            var actualTime = kCMTimeZero
+            var actualTime = CMTime.zero
             let imageRef = try imageGenerator.copyCGImage(at: time, actualTime:&actualTime)
-            
-            let img = UIImage(cgImage: imageRef)
-            
-            return img
+            return imageRef
         }
         catch let error as NSError
         {
@@ -476,4 +497,15 @@ fileprivate extension AVAsset {
             return nil
         }
     }
+}
+
+private func CGImageCreateJPEGData(from cgImage: CGImage, compressionQuality: CGFloat) -> Data? {
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data, kUTTypeJPEG, 1, nil) else {
+        return nil
+    }
+    let options = [kCGImageDestinationLossyCompressionQuality: compressionQuality] as CFDictionary
+    CGImageDestinationAddImage(destination, cgImage, options)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return data as Data
 }
